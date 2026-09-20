@@ -45,15 +45,32 @@ class IngestResponse(BaseModel):
     segment: SegmentOut
 
 
+class WithdrawResponse(BaseModel):
+    """误报事件撤回结果。
+
+    - ``deleted_segment``：原段仅含该事件，段随之删除，``segments`` 为空；
+    - ``shrunk_segment``：移除后原段未拆开（边界/最高级别可能重算），
+      保留段沿用原 id 且 revision 递增，``segments`` 含 1 个段；
+    - ``split_segment``：桥接事件移除导致原段拆成多段，最早子段沿用原 id
+      （revision 递增），其余子段新建（revision=1），按时间序全部返回。
+    """
+
+    source: str
+    event_id: str
+    result: Literal["deleted_segment", "shrunk_segment", "split_segment"]
+    segments: list[SegmentOut]
+
+
 class SegmentChange(BaseModel):
     """一条段变更记录。
 
     - upsert：段创建或边界/最高级别变化，segment 为变更时刻的完整快照；
-    - merged：墓碑，segment_id 段已被删除并并入 merged_into 指向的保留段。
+    - merged：墓碑，segment_id 段已被删除并并入 merged_into 指向的保留段；
+    - deleted：墓碑，segment_id 段因其唯一事件被撤回而删除（无并入目标）。
     """
 
     change_id: int
-    type: Literal["upsert", "merged"]
+    type: Literal["upsert", "merged", "deleted"]
     segment_id: int
     merged_into: int | None = None
     revision: int | None = None

@@ -34,8 +34,8 @@ CREATE INDEX IF NOT EXISTS idx_events_segment ON events (segment_id);
 -- 段变更流：供下游增量同步。与事件写入同事务追加，change_id 单调递增
 CREATE TABLE IF NOT EXISTS segment_changes (
     change_id    INTEGER PRIMARY KEY AUTOINCREMENT,  -- 单调递增的变更序号（分页游标）
-    type         TEXT    NOT NULL CHECK (type IN ('upsert', 'merged')),
-    segment_id   INTEGER NOT NULL,          -- upsert: 目标段；merged: 被删除段
+    type         TEXT    NOT NULL CHECK (type IN ('upsert', 'merged', 'deleted')),
+    segment_id   INTEGER NOT NULL,          -- upsert: 目标段；merged/deleted: 被删除段
     merged_into  INTEGER,                   -- 仅 merged：指向保留段 id
     revision     INTEGER,                   -- 仅 upsert：变更后的 revision
     source       TEXT,                      -- 以下仅 upsert：变更时刻的段快照
@@ -49,6 +49,40 @@ CREATE TABLE IF NOT EXISTS segment_changes (
 """
 
 
+def _migrate_segment_changes(conn: sqlite3.Connection) -> None:
+    """旧库 segment_changes 的 CHECK 仅允许 upsert/merged 时重建为含 deleted 的新表。
+
+    撤回功能新增 'deleted' 墓碑类型；CREATE TABLE IF NOT EXISTS 不会更新已有
+    持久化卷上的旧 CHECK 约束，故检测旧表 SQL 并在一次性事务内重建
+    （SQLite 无法直接 ALTER CHECK）。历史记录按原序保留，change_id 不变。
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='segment_changes'"
+    ).fetchone()
+    if row is not None and "'deleted'" not in row["sql"]:
+        conn.execute("ALTER TABLE segment_changes RENAME TO segment_changes_old")
+        conn.executescript(SCHEMA)  # 以新 CHECK 建 segment_changes
+        conn.execute(
+            """
+            INSERT INTO segment_changes
+                (change_id, type, segment_id, merged_into, revision, source,
+                 start_ts, end_ts, max_severity, event_count, created_at)
+            SELECT change_id, type, segment_id, merged_into, revision, source,
+                   start_ts, end_ts, max_severity, event_count, created_at
+            FROM segment_changes_old
+            ORDER BY change_id
+            """
+        )
+        conn.execute("DROP TABLE segment_changes_old")
+
+
+def init_db(db_path: str) -> None:
+    """建表并执行幂等迁移；Docker 启动时即完成数据库初始化。"""
+    with connect(db_path) as conn:
+        conn.executescript(SCHEMA)
+        _migrate_segment_changes(conn)
+
+
 def connect(db_path: str) -> sqlite3.Connection:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path, timeout=30)
@@ -57,12 +91,6 @@ def connect(db_path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=30000")
     return conn
-
-
-def init_db(db_path: str) -> None:
-    """建表，幂等；Docker 启动时即完成数据库初始化。"""
-    with connect(db_path) as conn:
-        conn.executescript(SCHEMA)
 
 
 @contextmanager

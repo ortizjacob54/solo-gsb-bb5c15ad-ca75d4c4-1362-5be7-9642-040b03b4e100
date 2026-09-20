@@ -14,10 +14,11 @@ from .schemas import (
     ResegmentationPreviewResponse,
     SegmentChangesPage,
     SegmentOut,
+    WithdrawResponse,
 )
 from . import service
 
-# SQLite 单写者：进程内串行化归段写入，配合事务保证合并一致性
+# SQLite 单写者：进程内串行化归段写入（含撤回），配合事务保证合并/拆段一致性
 _ingest_lock = threading.Lock()
 
 
@@ -29,7 +30,7 @@ def create_app(settings: Settings) -> FastAPI:
 
     app = FastAPI(
         title="设备告警事件段聚合服务",
-        version="1.0.0",
+        version="1.1.0",
         lifespan=lifespan,
     )
 
@@ -50,6 +51,29 @@ def create_app(settings: Settings) -> FastAPI:
                 severity=event.severity,
                 silence=settings.silence_interval_seconds,
             )
+
+    @app.delete("/events/{source}/{event_id}", response_model=WithdrawResponse)
+    def withdraw_event(source: str, event_id: str) -> dict:
+        """撤回误报事件：单事务内删除事件并按静默间隔重算其原段。
+
+        - 未知 (source, event_id) 返回 404；
+        - 唯一事件移除 → 删除原段并写 deleted 墓碑；
+        - 桥接事件移除导致拆段 → 最早子段沿用原 id（revision+1，upsert），
+          其余子段新建（revision=1，upsert）；
+        - 未拆段 → 保留原 id，边界/最高级别重算，revision+1，upsert；
+        - 任一步失败整体回滚，事件、段与变更流均保持撤回前状态。
+        """
+        with _ingest_lock, session(settings.database_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            result = service.withdraw_event(
+                conn,
+                source=source,
+                event_id=event_id,
+                silence=settings.silence_interval_seconds,
+            )
+        if result is None:
+            raise HTTPException(status_code=404, detail="event not found")
+        return result
 
     @app.get(
         "/segments/resegmentation-preview",

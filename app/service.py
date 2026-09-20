@@ -15,6 +15,13 @@
 - 合并时为每个被删除段写一条指向保留段的 merged 墓碑；
 - 仅事件数增加（revision 不变）不写 upsert；event_id 幂等重放不写任何记录。
 
+误报事件撤回（withdraw_event，与写入同级别单事务）：
+- 删除指定 (source, event_id) 事件后，按当前静默间隔对原段的剩余事件重新切分；
+- 无剩余事件（唯一事件）→ 删除原段并写一条 deleted 墓碑；
+- 桥接事件移除导致拆段时，最早子段沿用原段 id（revision 在原值上 +1），
+  其余子段新建（revision=1），各写一条 upsert；未拆段时同样 +1 并写 upsert；
+- 所有删除/更新/新建与变更流追加在同一事务内，任一步失败由调用方整体回滚。
+
 重分段预演（preview_resegmentation，纯读）：
 - 在同一只读事务内读取某 source 全部原始事件，按 (occurred_at, event_id)
   稳定排序后以候选静默间隔重新切分，得到不落库的模拟段与临时编号；
@@ -402,4 +409,158 @@ def preview_resegmentation(
             "existing_segment_count": len(existing_ids),
             "simulated_segment_count": len(simulated),
         },
+    }
+
+
+def withdraw_event(
+    conn: sqlite3.Connection,
+    *,
+    source: str,
+    event_id: str,
+    silence: float,
+) -> dict | None:
+    """撤回一个误报事件并按静默间隔重算其原段；事件不存在时返回 None（调用方回 404）。
+
+    调用方需持有事务（建议 BEGIN IMMEDIATE）并保证串行化；本函数的所有删除、
+    更新、新建与变更流追加均在该事务内执行，异常向上抛出由调用方整体回滚。
+
+    - 唯一事件移除（原段清空）：删除原段，写一条 deleted 墓碑；
+    - 未拆段：原段边界/最高级别重算，沿用原 id，revision 一律 +1，写 upsert；
+    - 桥接事件移除导致拆段：剩余事件按时间序切分，最早子段沿用原 id
+      （revision 在原值上 +1），其余子段新建（revision=1），各写一条 upsert。
+      change_id 顺序：保留段 upsert 在前，新建子段按时间序在后。
+    """
+    now = time.time()
+
+    event = conn.execute(
+        "SELECT segment_id, occurred_at, severity FROM events "
+        "WHERE source = ? AND event_id = ?",
+        (source, event_id),
+    ).fetchone()
+    if event is None:
+        return None
+
+    old_segment_id = event["segment_id"]
+    old = conn.execute(
+        "SELECT * FROM segments WHERE id = ?", (old_segment_id,)
+    ).fetchone()
+    if old is None:  # 理论不可达（外键），仍显式处理
+        return None
+
+    # 原段其余事件（排除被撤回事件），按时间序稳定排序后重切分
+    remaining = conn.execute(
+        """
+        SELECT event_id, occurred_at, severity
+        FROM events
+        WHERE segment_id = ? AND NOT (source = ? AND event_id = ?)
+        ORDER BY occurred_at, event_id
+        """,
+        (old_segment_id, source, event_id),
+    ).fetchall()
+
+    if not remaining:
+        # 唯一事件移除：删事件 + 删原段，原段写 deleted 墓碑
+        conn.execute(
+            "DELETE FROM events WHERE source = ? AND event_id = ?",
+            (source, event_id),
+        )
+        conn.execute("DELETE FROM segments WHERE id = ?", (old_segment_id,))
+        _record_change(
+            conn,
+            change_type="deleted",
+            segment_id=old_segment_id,
+            now=now,
+        )
+        return {
+            "source": source,
+            "event_id": event_id,
+            "result": "deleted_segment",
+            "segments": [],
+        }
+
+    # 与 preview 相同的切分：相邻事件间隔 > silence 处切分
+    groups: list[list[sqlite3.Row]] = []
+    for row in remaining:
+        if groups and row["occurred_at"] <= groups[-1][-1]["occurred_at"] + silence:
+            groups[-1].append(row)
+        else:
+            groups.append([row])
+
+    def _group_fields(group: list[sqlite3.Row]) -> tuple[float, float, str, int]:
+        start_ts = group[0]["occurred_at"]
+        end_ts = group[-1]["occurred_at"]
+        max_severity = sev.highest(*[g["severity"] for g in group])
+        return start_ts, end_ts, max_severity, len(group)
+
+    # 先删除被撤回事件，再更新/新建段（同事务，任一步失败整体回滚）
+    conn.execute(
+        "DELETE FROM events WHERE source = ? AND event_id = ?",
+        (source, event_id),
+    )
+
+    # 最早子段沿用原 id（含未拆段的唯一组），revision 在原值上 +1
+    start_ts, end_ts, max_severity, event_count = _group_fields(groups[0])
+    revision = old["revision"] + 1  # 撤回后保留段的 revision 必须递增
+    conn.execute(
+        """
+        UPDATE segments
+        SET start_ts = ?, end_ts = ?, max_severity = ?,
+            event_count = ?, revision = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (start_ts, end_ts, max_severity, event_count, revision, now,
+         old_segment_id),
+    )
+    _record_change(
+        conn,
+        change_type="upsert",
+        segment_id=old_segment_id,
+        now=now,
+        revision=revision,
+        source=source,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        max_severity=max_severity,
+        event_count=event_count,
+    )
+    result_segments = [get_segment(conn, old_segment_id)]
+
+    # 拆出的其余子段：新建段（revision=1）并把事件归属改到新段；
+    # 变更记录在保留段 upsert 之后按时间序追加，change_id 天然有序
+    for group in groups[1:]:
+        start_ts, end_ts, max_severity, event_count = _group_fields(group)
+        cur = conn.execute(
+            """
+            INSERT INTO segments
+                (source, start_ts, end_ts, max_severity, event_count, revision,
+                 created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+            """,
+            (source, start_ts, end_ts, max_severity, event_count, now, now),
+        )
+        new_id = cur.lastrowid
+        conn.executemany(
+            "UPDATE events SET segment_id = ? WHERE source = ? AND event_id = ?",
+            [(new_id, source, g["event_id"]) for g in group],
+        )
+        _record_change(
+            conn,
+            change_type="upsert",
+            segment_id=new_id,
+            now=now,
+            revision=1,
+            source=source,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            max_severity=max_severity,
+            event_count=event_count,
+        )
+        result_segments.append(get_segment(conn, new_id))
+
+    result = "shrunk_segment" if len(groups) == 1 else "split_segment"
+    return {
+        "source": source,
+        "event_id": event_id,
+        "result": result,
+        "segments": result_segments,
     }

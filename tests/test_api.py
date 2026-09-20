@@ -315,3 +315,136 @@ def test_preview_route_not_captured_by_segment_id(client):
 
 def test_healthz(client):
     assert client.get("/healthz").json() == {"status": "ok"}
+
+
+# ---- 误报事件撤回 DELETE /events/{source}/{event_id} ----
+
+def _delete(client, source, event_id):
+    return client.delete(f"/events/{source}/{event_id}")
+
+
+def test_withdraw_unknown_event_returns_404(client):
+    resp = _delete(client, "gw-01", "ghost")
+    assert resp.status_code == 404
+    # 存在该 event_id 但 source 不同：同样 404
+    _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z")
+    before = client.get("/segment-changes").json()
+    assert _delete(client, "gw-02", "e1").status_code == 404
+    # 404 不产生任何变更
+    assert client.get("/segment-changes").json() == before
+
+
+def test_withdraw_sole_event_deletes_segment(client):
+    seg = _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z", "warning")["segment"]
+    resp = _delete(client, "gw-01", "e1")
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "source": "gw-01",
+        "event_id": "e1",
+        "result": "deleted_segment",
+        "segments": [],
+    }
+    # 原段已不存在；重复撤回返回 404
+    assert client.get(f"/segments/{seg['id']}").status_code == 404
+    assert _delete(client, "gw-01", "e1").status_code == 404
+    page = client.get("/segment-changes").json()
+    assert [c["type"] for c in page["changes"]] == ["upsert", "deleted"]
+    tomb = page["changes"][-1]
+    assert tomb["segment_id"] == seg["id"]
+    assert tomb["merged_into"] is None
+    assert tomb["segment"] is None
+    # 撤回后可重新提交同一事件（幂等键已释放）
+    again = _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z")
+    assert again["deduplicated"] is False
+
+
+def test_withdraw_inner_event_shrinks_segment_and_bumps_revision(client):
+    first = _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z", "critical")
+    _post(client, "gw-01", "e2", "2026-09-20T08:00:30Z", "info")
+    _post(client, "gw-01", "e3", "2026-09-20T08:00:10Z", "debug")  # 段内，rev 不变
+    resp = _delete(client, "gw-01", "e3")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["result"] == "shrunk_segment"
+    seg = body["segments"][0]
+    assert seg["id"] == first["segment"]["id"]  # 沿用原 id
+    assert seg["revision"] == 3                  # rev=2 → 3（边界不变也必须递增）
+    assert seg["event_count"] == 2
+    assert seg["max_severity"] == "critical"
+    assert client.get(f"/segments/{seg['id']}").json()["event_count"] == 2
+
+
+def test_withdraw_recomputes_max_severity(client):
+    _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z", "info")
+    _post(client, "gw-01", "e2", "2026-09-20T08:00:30Z", "critical")
+    body = _delete(client, "gw-01", "e2").json()
+    assert body["segments"][0]["max_severity"] == "info"
+
+
+def test_withdraw_bridge_event_splits_segment(client):
+    a = _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z", "error")["segment"]
+    b = _post(client, "gw-01", "e2", "2026-09-20T08:02:00Z", "warning")["segment"]
+    bridged = _post(client, "gw-01", "e3", "2026-09-20T08:01:00Z", "critical")["segment"]
+
+    resp = _delete(client, "gw-01", "e3")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["result"] == "split_segment"
+    kept, new = body["segments"]
+    # 最早子段沿用原 id，revision 在桥接合并后的值上递增
+    assert kept["id"] == a["id"]
+    assert kept["revision"] == bridged["revision"] + 1
+    assert kept["event_count"] == 1
+    assert kept["max_severity"] == "error"
+    assert kept["started_at"].replace("Z", "+00:00") == "2026-09-20T08:00:00+00:00"
+    # 其余子段新建（不用被合并段 B 的 id），revision 从 1 开始
+    assert new["id"] not in (a["id"], b["id"])
+    assert new["revision"] == 1
+    assert new["event_count"] == 1
+    assert new["max_severity"] == "warning"
+    assert new["started_at"].replace("Z", "+00:00") == "2026-09-20T08:02:00+00:00"
+
+    segs = client.get("/segments", params={"source": "gw-01"}).json()
+    assert len(segs) == 2
+
+    # 变更流：保留段 upsert 在前、新段 upsert 在后，change_id 有序
+    page = client.get("/segment-changes").json()
+    tail = page["changes"][-2:]
+    assert [c["type"] for c in tail] == ["upsert", "upsert"]
+    assert tail[0]["segment_id"] == kept["id"]
+    assert tail[0]["revision"] == kept["revision"]
+    assert tail[1]["segment_id"] == new["id"]
+    assert tail[1]["revision"] == 1
+    assert tail[0]["change_id"] < tail[1]["change_id"]
+
+
+def test_withdraw_is_isolated_by_source(client):
+    _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z")
+    _post(client, "gw-01", "e2", "2026-09-20T08:02:00Z")
+    _post(client, "gw-01", "e3", "2026-09-20T08:01:00Z")
+    other = _post(client, "gw-02", "e9", "2026-09-20T08:00:05Z", "critical")
+    _delete(client, "gw-01", "e3")  # 拆 gw-01
+    seg = client.get(f"/segments/{other['segment']['id']}").json()
+    assert seg == other["segment"]
+
+
+def test_withdraw_then_reingest_rebridges(client):
+    a = _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z")["segment"]
+    _post(client, "gw-01", "e2", "2026-09-20T08:02:00Z")
+    _post(client, "gw-01", "e3", "2026-09-20T08:01:00Z")
+    _delete(client, "gw-01", "e3")
+    again = _post(client, "gw-01", "e3", "2026-09-20T08:01:00Z", "critical")
+    assert again["deduplicated"] is False
+    assert again["segment"]["id"] == a["id"]
+    assert again["segment"]["event_count"] == 3
+    assert len(client.get("/segments", params={"source": "gw-01"}).json()) == 1
+
+
+def test_withdraw_path_params_are_url_segments(client):
+    # 路径段支持 source/event_id 允许的 URL 安全字符
+    _post(client, "edge-gateway.01", "evt-0001_x", "2026-09-20T08:00:00Z")
+    resp = client.delete("/events/edge-gateway.01/evt-0001_x")
+    assert resp.status_code == 200
+    assert resp.json()["result"] == "deleted_segment"
+    # 缺失路径段不会误匹配到该路由（交由 404/405 语义）
+    assert client.delete("/events/edge-gateway.01").status_code in (404, 405)

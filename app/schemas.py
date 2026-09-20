@@ -45,15 +45,29 @@ class IngestResponse(BaseModel):
     segment: SegmentOut
 
 
+class RetractResponse(BaseModel):
+    """误报事件撤回结果。
+
+    segments 为重算后受影响的事件段（按 started_at、id 升序）：
+    - 移除桥接事件导致拆段时，最早子段沿用原 id，其余为新建段；
+    - 移除唯一事件导致原段整体消失时为空列表，变更流中另有 deleted 墓碑。
+    """
+
+    source: str
+    event_id: str
+    segments: list[SegmentOut]
+
+
 class SegmentChange(BaseModel):
     """一条段变更记录。
 
     - upsert：段创建或边界/最高级别变化，segment 为变更时刻的完整快照；
-    - merged：墓碑，segment_id 段已被删除并并入 merged_into 指向的保留段。
+    - merged：墓碑，segment_id 段已被删除并并入 merged_into 指向的保留段；
+    - deleted：墓碑，segment_id 段因唯一事件被误报撤回而整体消失。
     """
 
     change_id: int
-    type: Literal["upsert", "merged"]
+    type: Literal["upsert", "merged", "deleted"]
     segment_id: int
     merged_into: int | None = None
     revision: int | None = None

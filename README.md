@@ -1,6 +1,6 @@
 # 设备告警事件段聚合服务
 
-基于 FastAPI + SQLite 的告警汇聚服务：客户端上报离散告警事件，服务按 **source + 可配置静默间隔** 将乱序到达的事件归入同一事件段（segment），并保证 **event_id 幂等去重**——重复提交不改变任何计数。每次段变更都会同事务写入**单调递增的变更流**，下游可通过 `GET /segment-changes` 做增量同步。
+基于 FastAPI + SQLite 的告警汇聚服务：客户端上报离散告警事件，服务按 **source + 可配置静默间隔** 将乱序到达的事件归入同一事件段（segment），并保证 **event_id 幂等去重**——重复提交不改变任何计数。误报事件可通过 `DELETE /events/{source}/{event_id}` **撤回**，服务在单事务内删除事件并重算其原段（拆段沿用最早子段 id、唯一事件移除则删段）。每次段变更都会同事务写入**单调递增的变更流**，下游可通过 `GET /segment-changes` 做增量同步。
 
 ## 快速开始
 
@@ -41,6 +41,34 @@ curl -X POST http://localhost:8000/events \
 - `severity` 取值：`debug` / `info` / `warning` / `error` / `critical`（大小写不敏感，`warn`、`fatal` 为别名）
 - `occurred_at` 为 ISO 8601 时间；不带时区时按 UTC 处理
 - 响应：`{"deduplicated": false, "segment": {...}}`；重复提交同一 `(source, event_id)` 时 `deduplicated: true`，计数不变
+
+### 撤回误报事件 `DELETE /events/{source}/{event_id}`
+
+撤回一条已上报的误报事件：在**单个事务**内删除该事件，并按**现有静默间隔**重算其原事件段。
+
+```bash
+curl -X DELETE http://localhost:8000/events/edge-gateway-01/evt-0001
+```
+
+- 未知 `(source, event_id)` 返回 **404**；撤回成功后再次撤回同一事件同样返回 404。
+- **移除桥接事件造成拆段**：原段被拆成多个子段。时间最早的子段**沿用原段 id**，且其 `revision` 在原值上递增；其余子段为**新建段**（新 `id`，`revision` 从 1 起）。
+- **移除唯一事件**（或事件全部撤回）：**删除原段**，变更流中写入一条 `deleted` 墓碑。
+- 即使移除后段未拆开，只要段内还有事件，保留段的 `revision` 也必然递增（撤回本身即一次显式变更），并按剩余事件重算起止边界、最高级别与事件数。
+- 事件删除、段的 UPDATE/INSERT/DELETE、全部变更流记录在同一事务内提交；任一步失败**整体回滚**，库内状态不变。
+- 响应 `{"source", "event_id", "segments": [...]}`，`segments` 为重算后受影响的段（按 `started_at`、`id` 升序）；原段消失时为空列表：
+
+```json
+{
+  "source": "edge-gateway-01",
+  "event_id": "evt-0001",
+  "segments": [
+    {"id": 1, "source": "edge-gateway-01", "started_at": "...", "ended_at": "...",
+     "max_severity": "warning", "event_count": 1, "revision": 3},
+    {"id": 4, "source": "edge-gateway-01", "started_at": "...", "ended_at": "...",
+     "max_severity": "info", "event_count": 1, "revision": 1}
+  ]
+}
+```
 
 ### 查询事件段详情 `GET /segments/{id}`
 
@@ -147,16 +175,25 @@ curl 'http://localhost:8000/segment-changes?after=0&limit=100'
       "merged_into": 1,
       "revision": null,
       "segment": null
+    },
+    {
+      "change_id": 5,
+      "type": "deleted",
+      "segment_id": 1,
+      "merged_into": null,
+      "revision": null,
+      "segment": null
     }
   ],
-  "next_after": 4
+  "next_after": 5
 }
 ```
 
-- **何时产生记录**：每次创建段、边界或最高级别变化（`revision` 递增）、多段合并，都会在事件写入的**同一事务**内追加变更记录；`change_id` 全局单调递增。
+- **何时产生记录**：每次创建段、边界或最高级别变化（`revision` 递增）、多段合并、误报撤回重算，都会在对应写操作的**同一事务**内追加变更记录；`change_id` 全局单调递增。撤回拆段时记录顺序为：保留段 `upsert`（沿用原 id）→ 各新建段 `upsert`（按时间序）。
 - **`upsert`**：段的新状态，`segment` 为变更时刻的完整快照（含 `event_count`、`revision`）。
 - **`merged`**：合并墓碑，表示 `segment_id` 段已被删除并并入 `merged_into` 指向的保留段；每个被删除段各产生一条。
-- **何时不产生记录**：仅事件数增加（`revision` 不变）不写 `upsert`；重复提交 `(source, event_id)` 的幂等重放不写任何记录。
+- **`deleted`**：撤回墓碑，表示 `segment_id` 段因其唯一事件被撤回而整体消失；`merged_into` 为 `null`，无 `segment` 快照。
+- **何时不产生记录**：仅事件数增加（`revision` 不变）不写 `upsert`；重复提交 `(source, event_id)` 的幂等重放不写任何记录；撤回未知事件返回 404 且不写任何记录。
 - **分页约定**：用上一页返回的 `next_after` 作为下一页的 `after` 继续拉取；`change_id` 单调递增保证分页期间新写入的变更只会出现在后续页——不漏读、不重复。返回空页时 `next_after` 与入参 `after` 相同，可直接继续轮询。
 - `after` 默认 `0`（从头开始）；`limit` 默认 `100`，最大 `1000`。
 
@@ -167,7 +204,8 @@ curl 'http://localhost:8000/segment-changes?after=0&limit=100'
 - 新事件的 `occurred_at` 落在某段 `[start - silence, end + silence]` 窗口内即并入该段；同时命中多个段（迟到事件桥接）时自动合并为一段，事件数累加。
 - 段的 `revision` 初始为 1；**仅当**新事件导致段的起止边界或最高级别发生变化时递增，仅事件数增加不递增。
 - `(source, event_id)` 唯一约束保证幂等：重复提交直接返回原段，不改计数、不改 revision。
-- 上述每次段创建、边界/最高级别变化与合并都会写入变更流（见 `GET /segment-changes`），供下游增量同步；历史段（变更流上线前已存在）不补录，订阅从部署后的新变更开始。
+- **误报撤回**（`DELETE /events/{source}/{event_id}`）：单事务删除事件并按当前静默间隔重算原段；移除桥接事件拆段时最早子段沿用原 id（`revision` 递增）、其余子段新建，移除唯一事件则删除原段并写 `deleted` 墓碑；任一步失败整体回滚。撤回后以同一 `(source, event_id)` 重新上报视为新事件。
+- 上述每次段创建、边界/最高级别变化、合并与撤回都会写入变更流（见 `GET /segment-changes`），供下游增量同步；历史段（变更流上线前已存在）不补录，订阅从部署后的新变更开始。升级时持久化卷中的旧库会自动把变更流迁移到含 `deleted` 的新 schema，并保留历史 `change_id` 顺序。
 - 想评估调整 `SILENCE_INTERVAL_SECONDS` 的影响时，调用重分段预演接口（见 `GET /segments/resegmentation-preview`），可在不改动任何数据的前提下查看模拟段与现有段的 split/merged 映射。
 
 ## 本地开发与测试

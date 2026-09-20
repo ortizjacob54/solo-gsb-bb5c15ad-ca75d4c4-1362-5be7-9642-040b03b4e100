@@ -45,6 +45,13 @@ class ServiceTestCase(unittest.TestCase):
         with session(self.db_path) as conn:
             return service.list_segment_changes(conn, after=after, limit=limit)
 
+    def retract(self, source, event_id):
+        with session(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            return service.retract_event(
+                conn, source=source, event_id=event_id, silence=SILENCE
+            )
+
     def test_first_event_creates_segment(self):
         r = self.submit("s1", "e1", 1000.0, "warning")
         self.assertFalse(r["deduplicated"])
@@ -238,6 +245,223 @@ class ServiceTestCase(unittest.TestCase):
         page = self.changes(after=42)
         self.assertEqual(page, {"changes": [], "next_after": 42})
 
+    # ---- 误报事件撤回（retract_event）----
+
+    def test_retract_unknown_event_returns_none(self):
+        self.submit("s1", "e1", 1000.0)
+        before_changes = self.changes()
+        self.assertIsNone(self.retract("s1", "ghost"))
+        self.assertIsNone(self.retract("ghost", "e1"))
+        # 未写任何变更、未删任何段
+        self.assertEqual(self.changes(), before_changes)
+        with session(self.db_path) as conn:
+            self.assertEqual(len(service.list_segments(conn)), 1)
+
+    def test_retract_sole_event_deletes_segment_and_writes_tombstone(self):
+        r = self.submit("s1", "e1", 1000.0, "warning")
+        seg_id = r["segment"]["id"]
+        before = self.changes()
+
+        out = self.retract("s1", "e1")
+        self.assertEqual(out, {"source": "s1", "event_id": "e1", "segments": []})
+
+        self.assertIsNone(self.get(seg_id))
+        with session(self.db_path) as conn:
+            self.assertEqual(service.list_segments(conn, "s1"), [])
+            n = conn.execute("SELECT COUNT(*) AS c FROM events").fetchone()["c"]
+            self.assertEqual(n, 0)
+
+        new = self.changes(after=before["next_after"])["changes"]
+        self.assertEqual(len(new), 1)
+        ch = new[0]
+        self.assertEqual(ch["type"], "deleted")
+        self.assertEqual(ch["segment_id"], seg_id)
+        self.assertIsNone(ch["merged_into"])
+        self.assertIsNone(ch["revision"])
+        self.assertIsNone(ch["segment"])
+
+    def test_retract_inner_event_shrinks_segment_and_bumps_revision(self):
+        # [0, 0]、[5, 5]（在窗口内）→ 段 [0,5]；撤回 0 处事件后仅剩 5
+        r = self.submit("s1", "e1", 0.0)
+        self.submit("s1", "e2", 5.0, "critical")
+        seg_id = r["segment"]["id"]
+        self.assertEqual(self.get(seg_id)["revision"], 2)
+
+        out = self.retract("s1", "e1")
+        self.assertEqual(len(out["segments"]), 1)
+        seg = out["segments"][0]
+        self.assertEqual(seg["id"], seg_id)          # 沿用原 id
+        self.assertEqual(seg["event_count"], 1)
+        self.assertEqual(seg["revision"], 3)         # 撤回必递增，哪怕仍是同段
+        self.assertEqual(seg["max_severity"], "critical")
+        self.assertEqual(seg["started_at"], seg["ended_at"])
+        self.assertEqual(seg["ended_at"], "1970-01-01T00:00:05+00:00")
+
+        # 事件仍挂在原段
+        with session(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT segment_id FROM events WHERE event_id = 'e2'"
+            ).fetchone()
+            self.assertEqual(row["segment_id"], seg_id)
+
+        new = self.changes(after=2)["changes"]
+        self.assertEqual([c["type"] for c in new], ["upsert"])
+        self.assertEqual(new[0]["segment"], seg)
+
+    def test_retract_bridge_event_splits_segment_earliest_keeps_id(self):
+        # 0 与 20 各成段（间隔 > 10），10 桥接合并为一段 [0,20]
+        a = self.submit("s1", "e1", 0.0)["segment"]
+        self.submit("s1", "e2", 20.0)
+        self.submit("s1", "e3", 10.0)
+        seg_id = a["id"]
+        self.assertEqual(self.get(seg_id)["event_count"], 3)
+        self.assertEqual(self.get(seg_id)["revision"], 2)
+        changes_before = len(self.changes()["changes"])
+
+        out = self.retract("s1", "e3")               # 撤掉桥接事件
+        self.assertEqual(len(out["segments"]), 2)
+        kept, created = out["segments"]
+        self.assertEqual(kept["id"], seg_id)         # 最早子段沿用原 id
+        self.assertEqual(kept["event_count"], 1)
+        self.assertEqual(kept["revision"], 3)        # revision 递增
+        self.assertEqual(kept["started_at"], "1970-01-01T00:00:00+00:00")
+        self.assertNotIn(created["id"], (seg_id,))
+        self.assertEqual(created["event_count"], 1)
+        self.assertEqual(created["revision"], 1)     # 新段 revision 从 1 起
+        self.assertEqual(created["started_at"], "1970-01-01T00:00:20+00:00")
+
+        with session(self.db_path) as conn:
+            segs = service.list_segments(conn, "s1")
+            self.assertEqual({s["id"] for s in segs}, {kept["id"], created["id"]})
+            e1 = conn.execute(
+                "SELECT segment_id FROM events WHERE event_id = 'e1'"
+            ).fetchone()
+            e2 = conn.execute(
+                "SELECT segment_id FROM events WHERE event_id = 'e2'"
+            ).fetchone()
+            self.assertEqual(e1["segment_id"], kept["id"])
+            self.assertEqual(e2["segment_id"], created["id"])
+            self.assertIsNone(
+                conn.execute(
+                    "SELECT 1 FROM events WHERE event_id = 'e3'"
+                ).fetchone()
+            )
+
+        # 变更流：保留段 upsert 在前、新段 upsert 在后，change_id 保序
+        new = self.changes(after=changes_before)["changes"]
+        self.assertEqual([c["type"] for c in new], ["upsert", "upsert"])
+        self.assertEqual(new[0]["segment_id"], kept["id"])
+        self.assertEqual(new[0]["revision"], 3)
+        self.assertEqual(new[1]["segment_id"], created["id"])
+        self.assertEqual(new[1]["revision"], 1)
+        self.assertEqual(new[1]["segment"], created)
+        self.assertLess(new[0]["change_id"], new[1]["change_id"])
+
+    def test_retract_bridge_splits_segment_into_two_clusters(self):
+        # [0,5] 与 [20,25] 两段（间隔 15 > 10），12 处事件桥接合并为 [0,25]
+        self.submit("s1", "e1", 0.0)
+        a = self.submit("s1", "e2", 5.0)["segment"]
+        self.submit("s1", "e3", 20.0)
+        self.submit("s1", "e4", 25.0)
+        self.submit("s1", "e5", 12.0)                # 桥接两段
+        seg_id = a["id"]
+        self.assertEqual(self.get(seg_id)["event_count"], 5)
+        prior_revision = self.get(seg_id)["revision"]
+        changes_before = len(self.changes()["changes"])
+
+        out = self.retract("s1", "e5")               # 撤掉桥接事件
+        self.assertEqual(len(out["segments"]), 2)
+        kept, created = out["segments"]
+        self.assertEqual(kept["id"], seg_id)
+        self.assertEqual(kept["event_count"], 2)     # [0,5]
+        self.assertEqual(kept["revision"], prior_revision + 1)
+        self.assertEqual(created["event_count"], 2)  # [20,25]
+        self.assertEqual(created["revision"], 1)
+        self.assertEqual(
+            kept["started_at"], "1970-01-01T00:00:00+00:00"
+        )
+        self.assertEqual(
+            created["started_at"], "1970-01-01T00:00:20+00:00"
+        )
+
+    def test_retract_does_not_remerge_with_neighbouring_segments(self):
+        # s1：[0,0] 与 [10.5, 20.5] 两段；撤回 0 段唯一事件 → 该段消失，
+        # 不会与另一相邻段发生合并重算
+        self.submit("s1", "e1", 0.0)
+        other = self.submit("s1", "e2", 10.5)["segment"]
+        out = self.retract("s1", "e1")
+        self.assertEqual(out["segments"], [])
+        with session(self.db_path) as conn:
+            segs = service.list_segments(conn, "s1")
+        self.assertEqual([s["id"] for s in segs], [other["id"]])
+        self.assertEqual(segs[0]["event_count"], 1)
+
+    def test_retract_is_isolated_by_source(self):
+        self.submit("s1", "e1", 0.0)
+        self.submit("s2", "e1", 0.0)
+        out = self.retract("s1", "e1")
+        self.assertEqual(out["segments"], [])
+        with session(self.db_path) as conn:
+            self.assertEqual(len(service.list_segments(conn)), 1)
+            self.assertEqual(service.list_segments(conn)[0]["source"], "s2")
+
+    def test_retract_then_reingest_same_event_id(self):
+        r = self.submit("s1", "e1", 0.0)
+        old_id = r["segment"]["id"]
+        self.retract("s1", "e1")
+        # 误报修正后以同 id 重新上报（不同时间）：全新段，不复用已删 id
+        again = self.submit("s1", "e1", 100.0)
+        self.assertFalse(again["deduplicated"])
+        self.assertNotEqual(again["segment"]["id"], old_id)
+        self.assertEqual(again["segment"]["revision"], 1)
+
+    def test_retract_recomputes_max_severity(self):
+        self.submit("s1", "e1", 0.0, "critical")
+        self.submit("s1", "e2", 5.0, "info")
+        out = self.retract("s1", "e1")
+        self.assertEqual(out["segments"][0]["max_severity"], "info")
+
+    def test_retract_rollback_entirely_on_failure(self):
+        from app.db import connect
+
+        self.submit("s1", "e1", 0.0)
+        self.submit("s1", "e2", 20.0)
+        bridge = self.submit("s1", "e3", 10.0)["segment"]
+        seg_id = bridge["id"]
+        changes_before = self.changes()
+
+        # 在受控事务内让“写变更流”一步失败，随后显式回滚：
+        # 事件删除、拆段 UPDATE/INSERT 必须全部撤销
+        conn = connect(self.db_path)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            original_record = service._record_change
+
+            def boom(*args, **kwargs):
+                raise RuntimeError("change stream write failed")
+
+            service._record_change = boom
+            try:
+                with self.assertRaises(RuntimeError):
+                    service.retract_event(
+                        conn, source="s1", event_id="e3", silence=SILENCE
+                    )
+            finally:
+                service._record_change = original_record
+            conn.rollback()
+        finally:
+            conn.close()
+
+        seg = self.get(seg_id)
+        self.assertEqual(seg["event_count"], 3)
+        self.assertEqual(seg["revision"], 2)
+        with session(self.db_path) as conn2:
+            self.assertEqual(len(service.list_segments(conn2, "s1")), 1)
+            self.assertEqual(
+                conn2.execute("SELECT COUNT(*) AS c FROM events").fetchone()["c"], 3
+            )
+        self.assertEqual(self.changes(), changes_before)
+
     # ---- 静默间隔重分段预演（纯读）----
 
     def preview(self, source, silence):
@@ -423,6 +647,64 @@ class ServiceTestCase(unittest.TestCase):
                 )
         # 回滚释放后库仍可正常写入
         self.submit("s1", "e2", 8.0)
+
+    # ---- 旧库变更流迁移（deleted 类型上线）----
+
+    def test_legacy_changes_table_migrates_and_keeps_change_id_order(self):
+        import sqlite3
+
+        legacy = os.path.join(self.tmp.name, "legacy.db")
+        conn = sqlite3.connect(legacy)
+        conn.executescript(
+            """
+            CREATE TABLE segment_changes (
+                change_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type TEXT NOT NULL CHECK (type IN ('upsert', 'merged')),
+                segment_id INTEGER NOT NULL, merged_into INTEGER,
+                revision INTEGER, source TEXT, start_ts REAL, end_ts REAL,
+                max_severity TEXT, event_count INTEGER, created_at REAL NOT NULL
+            );
+            INSERT INTO segment_changes
+                (change_id, type, segment_id, merged_into, revision, source,
+                 start_ts, end_ts, max_severity, event_count, created_at)
+            VALUES
+                (1, 'upsert', 1, NULL, 1, 's1', 0, 0, 'info', 1, 0),
+                (2, 'merged', 2, 1, NULL, NULL, NULL, NULL, NULL, NULL, 0);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        # init_db 幂等建表并检测到旧 CHECK → 同事务迁移
+        init_db(legacy)
+        with session(legacy) as conn:
+            rows = conn.execute(
+                "SELECT change_id, type, segment_id, merged_into "
+                "FROM segment_changes ORDER BY change_id"
+            ).fetchall()
+            self.assertEqual(
+                [tuple(r) for r in rows],
+                [(1, "upsert", 1, None), (2, "merged", 2, 1)],
+            )
+
+        # 迁移后可写 deleted 墓碑，且 change_id 接续历史最大值
+        with session(legacy) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            service._record_change(
+                conn, change_type="deleted", segment_id=1, now=0.0
+            )
+        with session(legacy) as conn:
+            row = conn.execute(
+                "SELECT change_id, type FROM segment_changes "
+                "WHERE type = 'deleted'"
+            ).fetchone()
+            self.assertEqual(tuple(row), (3, "deleted"))
+
+        # 再次 init_db 为幂等 no-op，数据不丢不重
+        init_db(legacy)
+        with session(legacy) as conn:
+            n = conn.execute("SELECT COUNT(*) AS c FROM segment_changes").fetchone()
+            self.assertEqual(n["c"], 3)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,25 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
+# 段变更流表 DDL：供下游增量同步。与事件写入同事务追加，change_id 单调递增。
+# 单独成常量，便于既有库迁移时重建（误报撤回在 CHECK 中新增了 deleted 类型）。
+SEGMENT_CHANGES_DDL = """
+CREATE TABLE IF NOT EXISTS segment_changes (
+    change_id    INTEGER PRIMARY KEY AUTOINCREMENT,  -- 单调递增的变更序号（分页游标）
+    type         TEXT    NOT NULL CHECK (type IN ('upsert', 'merged', 'deleted')),
+    segment_id   INTEGER NOT NULL,          -- upsert: 目标段；墓碑: 被删除段
+    merged_into  INTEGER,                   -- 仅 merged：指向保留段 id
+    revision     INTEGER,                   -- 仅 upsert：变更后的 revision
+    source       TEXT,                      -- 以下仅 upsert：变更时刻的段快照
+    start_ts     REAL,
+    end_ts       REAL,
+    max_severity TEXT,
+    event_count  INTEGER,
+    created_at   REAL    NOT NULL
+);
+-- 查询模式为 WHERE change_id > ? ORDER BY change_id，主键即索引，无需额外索引
+"""
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS segments (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -31,22 +50,48 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_segment ON events (segment_id);
 
--- 段变更流：供下游增量同步。与事件写入同事务追加，change_id 单调递增
-CREATE TABLE IF NOT EXISTS segment_changes (
-    change_id    INTEGER PRIMARY KEY AUTOINCREMENT,  -- 单调递增的变更序号（分页游标）
-    type         TEXT    NOT NULL CHECK (type IN ('upsert', 'merged')),
-    segment_id   INTEGER NOT NULL,          -- upsert: 目标段；merged: 被删除段
-    merged_into  INTEGER,                   -- 仅 merged：指向保留段 id
-    revision     INTEGER,                   -- 仅 upsert：变更后的 revision
-    source       TEXT,                      -- 以下仅 upsert：变更时刻的段快照
-    start_ts     REAL,
-    end_ts       REAL,
-    max_severity TEXT,
-    event_count  INTEGER,
-    created_at   REAL    NOT NULL
-);
--- 查询模式为 WHERE change_id > ? ORDER BY change_id，主键即索引，无需额外索引
-"""
+""" + SEGMENT_CHANGES_DDL
+
+
+def _needs_changes_migration(conn: sqlite3.Connection) -> bool:
+    """既有库的 segment_changes 仍为旧 schema（CHECK 不含 deleted）时返回真。"""
+    sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'segment_changes'"
+    ).fetchone()
+    return bool(sql) and "'deleted'" not in sql[0]
+
+
+def _migrate_segment_changes(conn: sqlite3.Connection) -> None:
+    """放宽变更流 CHECK 到 upsert/merged/deleted。
+
+    换表并按原 change_id 逐条复制，AUTOINCREMENT 序列取 MAX(change_id)，
+    保证撤回产生的新记录接在历史之后、change_id 顺序不乱。
+    """
+    conn.execute("ALTER TABLE segment_changes RENAME TO segment_changes_old")
+    conn.execute(SEGMENT_CHANGES_DDL)
+    conn.execute(
+        """
+        INSERT INTO segment_changes
+            (change_id, type, segment_id, merged_into, revision, source,
+             start_ts, end_ts, max_severity, event_count, created_at)
+        SELECT change_id, type, segment_id, merged_into, revision, source,
+               start_ts, end_ts, max_severity, event_count, created_at
+        FROM segment_changes_old
+        ORDER BY change_id
+        """
+    )
+    conn.execute("DROP TABLE segment_changes_old")
+    # 重建 AUTOINCREMENT 序列，使下一条 change_id 接续历史最大值；表为空时
+    # 删除可能存在的旧序列行，让下一条记录从 1 开始
+    max_id = conn.execute(
+        "SELECT MAX(change_id) AS m FROM segment_changes"
+    ).fetchone()["m"]
+    conn.execute("DELETE FROM sqlite_sequence WHERE name = 'segment_changes'")
+    if max_id is not None:
+        conn.execute(
+            "INSERT INTO sqlite_sequence (name, seq) VALUES ('segment_changes', ?)",
+            (max_id,),
+        )
 
 
 def connect(db_path: str) -> sqlite3.Connection:
@@ -60,9 +105,12 @@ def connect(db_path: str) -> sqlite3.Connection:
 
 
 def init_db(db_path: str) -> None:
-    """建表，幂等；Docker 启动时即完成数据库初始化。"""
+    """建表，幂等；Docker 启动时即完成数据库初始化（含旧库轻量迁移）。"""
     with connect(db_path) as conn:
         conn.executescript(SCHEMA)
+        if _needs_changes_migration(conn):
+            # 部署在持久卷中的既有库仍为旧 CHECK（无 deleted）：同事务迁移
+            _migrate_segment_changes(conn)
 
 
 @contextmanager

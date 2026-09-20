@@ -181,6 +181,107 @@ def test_segment_changes_param_validation(client):
     assert client.get("/segment-changes", params={"limit": 1001}).status_code == 422
 
 
+def _delete(client, source, event_id):
+    resp = client.delete(f"/events/{source}/{event_id}")
+    assert resp.status_code == 200
+    return resp.json()
+
+
+def test_retract_unknown_event_404(client):
+    resp = client.delete("/events/gw-01/ghost")
+    assert resp.status_code == 404
+    # 同 event_id 但 source 不同也是未知
+    _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z")
+    assert client.delete("/events/gw-02/e1").status_code == 404
+    # 撤回成功后再次撤回 → 404
+    assert client.delete("/events/gw-01/e1").status_code == 200
+    assert client.delete("/events/gw-01/e1").status_code == 404
+
+
+def test_retract_sole_event_deletes_segment(client):
+    seg = _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z")["segment"]
+    body = _delete(client, "gw-01", "e1")
+    assert body == {"source": "gw-01", "event_id": "e1", "segments": []}
+    assert client.get(f"/segments/{seg['id']}").status_code == 404
+    assert client.get("/segments", params={"source": "gw-01"}).json() == []
+
+    page = client.get("/segment-changes").json()
+    tomb = page["changes"][-1]
+    assert tomb["type"] == "deleted"
+    assert tomb["segment_id"] == seg["id"]
+    assert tomb["merged_into"] is None
+    assert tomb["segment"] is None
+
+
+def test_retract_bridge_event_splits_segment_via_api(client):
+    # silence=60：08:00:00 与 08:02:00 各自成段，08:01:00 桥接合并
+    a = _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z", "warning")["segment"]
+    b = _post(client, "gw-01", "e2", "2026-09-20T08:02:00Z", "info")["segment"]
+    _post(client, "gw-01", "e3", "2026-09-20T08:01:00Z", "error")
+    n_changes = len(client.get("/segment-changes").json()["changes"])
+
+    body = _delete(client, "gw-01", "e3")
+    segments = body["segments"]
+    assert body["source"] == "gw-01"
+    assert body["event_id"] == "e3"
+    assert len(segments) == 2
+    kept, created = segments
+    assert kept["id"] == a["id"]                  # 最早子段沿用原 id
+    assert kept["event_count"] == 1
+    assert kept["revision"] == 3
+    assert kept["max_severity"] == "warning"
+    assert created["id"] != kept["id"]           # 拆出的子段是新建段
+    assert created["id"] >= b["id"]
+    assert created["event_count"] == 1
+    assert created["revision"] == 1
+    assert created["max_severity"] == "info"
+
+    # GET 端点可查到两段
+    listed = client.get("/segments", params={"source": "gw-01"}).json()
+    assert sorted(s["id"] for s in listed) == sorted([kept["id"], created["id"]])
+
+    # 变更流：保留段 upsert、新段 upsert，change_id 严格递增
+    page = client.get(
+        "/segment-changes", params={"after": 0, "limit": 1000}
+    ).json()
+    new = page["changes"][n_changes:]
+    assert [c["type"] for c in new] == ["upsert", "upsert"]
+    assert new[0]["segment_id"] == kept["id"]
+    assert new[0]["segment"] == kept
+    assert new[1]["segment_id"] == created["id"]
+    assert new[1]["segment"] == created
+    assert new[0]["change_id"] < new[1]["change_id"]
+
+
+def test_retract_inner_event_shrinks_and_bumps_revision_via_api(client):
+    seg = _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z", "info")["segment"]
+    _post(client, "gw-01", "e2", "2026-09-20T08:00:30Z", "critical")
+    body = _delete(client, "gw-01", "e2")
+    assert len(body["segments"]) == 1
+    remaining = body["segments"][0]
+    assert remaining["id"] == seg["id"]
+    assert remaining["event_count"] == 1
+    assert remaining["revision"] == 3
+    assert remaining["max_severity"] == "info"
+
+
+def test_retract_is_isolated_by_source_via_api(client):
+    _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z")
+    _post(client, "gw-02", "e1", "2026-09-20T08:00:00Z")
+    assert _delete(client, "gw-01", "e1")["segments"] == []
+    remaining = client.get("/segments").json()
+    assert len(remaining) == 1
+    assert remaining[0]["source"] == "gw-02"
+
+
+def test_retract_then_reingest_is_not_deduplicated(client):
+    seg = _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z")["segment"]
+    _delete(client, "gw-01", "e1")
+    again = _post(client, "gw-01", "e1", "2026-09-20T09:00:00Z")
+    assert again["deduplicated"] is False
+    assert again["segment"]["id"] != seg["id"]
+
+
 def test_preview_split_merge_and_unchanged(client):
     # silence=60：08:00:00、08:00:30 同段；08:02:00、08:02:30 另一段
     _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z", "warning")

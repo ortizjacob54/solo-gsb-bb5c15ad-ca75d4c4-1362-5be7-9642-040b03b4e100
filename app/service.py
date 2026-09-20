@@ -13,7 +13,15 @@
 - 每次创建段、边界或最高级别变化（revision 递增）、多段合并，都在事件写入
   事务内向 segment_changes 追加记录，change_id 单调递增；
 - 合并时为每个被删除段写一条指向保留段的 merged 墓碑；
+- 误报撤回导致原段整体消失时写一条 deleted 墓碑（无 merged_into）；
 - 仅事件数增加（revision 不变）不写 upsert；event_id 幂等重放不写任何记录。
+
+误报事件撤回（retract_event）：
+- 删除已提交的误报事件，并在同一事务内按现有静默间隔重算其原段；
+- 移除的若是桥接事件，原段可能拆成多段：时间最早的子段沿用原段 id 且
+  revision 递增，其余子段以新 id 新建（revision 从 1 起）；
+- 原段事件全部移除（唯一事件）时删除原段并写 deleted 墓碑；
+- 保留段与每个新段各写一条 upsert，全部变更同事务追加、change_id 保序。
 
 重分段预演（preview_resegmentation，纯读）：
 - 在同一只读事务内读取某 source 全部原始事件，按 (occurred_at, event_id)
@@ -279,6 +287,152 @@ def ingest_event(
         (segment_id, source, event_id, occurred_ts, severity, now),
     )
     return {"deduplicated": False, "segment": get_segment(conn, segment_id)}
+
+
+def retract_event(
+    conn: sqlite3.Connection,
+    *,
+    source: str,
+    event_id: str,
+    silence: float,
+) -> dict | None:
+    """撤回误报事件：删除事件并重算其原段。
+
+    返回 None 表示 (source, event_id) 不存在（调用方据此响应 404）；否则返回
+    {"source", "event_id", "segments"}，segments 为重算后受影响的段，按
+    (started_at, id) 升序；原段整体消失时为空列表。
+
+    调用方需在单个写事务内调用（建议 BEGIN IMMEDIATE）并保证串行化；
+    任一步失败由调用方事务整体回滚。
+    """
+    now = time.time()
+
+    event = conn.execute(
+        "SELECT segment_id FROM events WHERE source = ? AND event_id = ?",
+        (source, event_id),
+    ).fetchone()
+    if event is None:
+        return None
+    original_id = event["segment_id"]
+
+    original = conn.execute(
+        "SELECT * FROM segments WHERE id = ?", (original_id,)
+    ).fetchone()
+
+    # 先删事件；随后仅重算原段剩余事件——撤回只会让段缩小/拆段，
+    # 不会与同 source 的其他段重新合并（它们此前本就与原段不相邻）
+    conn.execute(
+        "DELETE FROM events WHERE source = ? AND event_id = ?",
+        (source, event_id),
+    )
+
+    remaining = conn.execute(
+        """
+        SELECT event_id, occurred_at, severity
+        FROM events
+        WHERE segment_id = ?
+        ORDER BY occurred_at, event_id
+        """,
+        (original_id,),
+    ).fetchall()
+
+    if not remaining:
+        # 唯一事件移除 → 原段消失，写 deleted 墓碑（不指向任何保留段）
+        conn.execute("DELETE FROM segments WHERE id = ?", (original_id,))
+        _record_change(
+            conn,
+            change_type="deleted",
+            segment_id=original_id,
+            now=now,
+        )
+        return {"source": source, "event_id": event_id, "segments": []}
+
+    # 按现有静默间隔重新切分剩余事件（与 preview 的纯读重算规则一致：
+    # 相邻事件间隔大于 silence 处切分，恰好等于仍同段）
+    groups: list[list[sqlite3.Row]] = []
+    for row in remaining:
+        if groups and row["occurred_at"] <= groups[-1][-1]["occurred_at"] + silence:
+            groups[-1].append(row)
+        else:
+            groups.append([row])
+
+    # 事件已按时间排序，groups 亦按时间排序：最早子段沿用原 id
+    first = groups[0]
+    start_ts = first[0]["occurred_at"]
+    end_ts = first[-1]["occurred_at"]
+    max_severity = sev.highest(*[r["severity"] for r in first])
+    event_count = len(first)
+    # 保留段无论边界/级别是否变化，revision 必须递增（撤回即一次显式变更）
+    revision = original["revision"] + 1
+    conn.execute(
+        """
+        UPDATE segments
+        SET start_ts = ?, end_ts = ?, max_severity = ?,
+            event_count = ?, revision = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (start_ts, end_ts, max_severity, event_count, revision, now, original_id),
+    )
+    _record_change(
+        conn,
+        change_type="upsert",
+        segment_id=original_id,
+        now=now,
+        revision=revision,
+        source=source,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        max_severity=max_severity,
+        event_count=event_count,
+    )
+
+    # 其余子段新建并把对应事件改挂到新段（groups 按时间排序，change_id 顺序
+    # 自然为“保留段 upsert、新段按时间序 upsert”）
+    segment_ids = [original_id]
+    for group in groups[1:]:
+        g_start = group[0]["occurred_at"]
+        g_end = group[-1]["occurred_at"]
+        g_sev = sev.highest(*[r["severity"] for r in group])
+        cur = conn.execute(
+            """
+            INSERT INTO segments
+                (source, start_ts, end_ts, max_severity, event_count, revision,
+                 created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+            """,
+            (source, g_start, g_end, g_sev, len(group), now, now),
+        )
+        new_id = cur.lastrowid
+        ids = [r["event_id"] for r in group]
+        marks = ",".join("?" * len(ids))
+        conn.execute(
+            f"UPDATE events SET segment_id = ? WHERE segment_id = ? "
+            f"AND event_id IN ({marks})",
+            [new_id, original_id, *ids],
+        )
+        _record_change(
+            conn,
+            change_type="upsert",
+            segment_id=new_id,
+            now=now,
+            revision=1,
+            source=source,
+            start_ts=g_start,
+            end_ts=g_end,
+            max_severity=g_sev,
+            event_count=len(group),
+        )
+        segment_ids.append(new_id)
+
+    rows = conn.execute(
+        f"SELECT * FROM segments WHERE id IN ({','.join('?' * len(segment_ids))})",
+        segment_ids,
+    ).fetchall()
+    segments = sorted(
+        (_row_to_segment(r) for r in rows),
+        key=lambda s: (s["started_at"], s["id"]),
+    )
+    return {"source": source, "event_id": event_id, "segments": segments}
 
 
 def preview_resegmentation(

@@ -4,7 +4,7 @@ from __future__ import annotations
 import threading
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Path, Query
 
 from .config import Settings
 from .db import init_db, read_only_session, session
@@ -12,13 +12,14 @@ from .schemas import (
     EventIn,
     IngestResponse,
     ResegmentationPreviewResponse,
+    RetractResponse,
     SegmentChangesPage,
     SegmentOut,
 )
 from . import service
 
-# SQLite 单写者：进程内串行化归段写入，配合事务保证合并一致性
-_ingest_lock = threading.Lock()
+# SQLite 单写者：进程内串行化段写入（提交与撤回共用），配合事务保证一致性
+_write_lock = threading.Lock()
 
 
 def create_app(settings: Settings) -> FastAPI:
@@ -40,7 +41,7 @@ def create_app(settings: Settings) -> FastAPI:
     @app.post("/events", response_model=IngestResponse)
     def submit_event(event: EventIn) -> dict:
         """提交告警事件；按 source + 静默间隔归段，event_id 幂等去重。"""
-        with _ingest_lock, session(settings.database_path) as conn:
+        with _write_lock, session(settings.database_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             return service.ingest_event(
                 conn,
@@ -50,6 +51,36 @@ def create_app(settings: Settings) -> FastAPI:
                 severity=event.severity,
                 silence=settings.silence_interval_seconds,
             )
+
+    @app.delete(
+        "/events/{source}/{event_id}",
+        response_model=RetractResponse,
+        responses={404: {"description": "未知 (source, event_id)"}},
+    )
+    def retract_event(
+        source: str = Path(min_length=1, max_length=256),
+        event_id: str = Path(min_length=1, max_length=256),
+    ) -> dict:
+        """撤回误报事件：单事务内删除事件并按现有静默间隔重算其原段。
+
+        - 移除桥接事件造成拆段时，最早子段沿用原 id（revision 递增），
+          其余子段新建；移除唯一事件则删除原段并写 deleted 墓碑；
+        - 全部 upsert/墓碑与删除同事务提交，change_id 保序，失败整体回滚；
+        - 未知 (source, event_id) 返回 404。
+        """
+        with _write_lock, session(settings.database_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            result = service.retract_event(
+                conn,
+                source=source,
+                event_id=event_id,
+                silence=settings.silence_interval_seconds,
+            )
+        if result is None:
+            raise HTTPException(
+                status_code=404, detail="event not found for source/event_id"
+            )
+        return result
 
     @app.get(
         "/segments/resegmentation-preview",
